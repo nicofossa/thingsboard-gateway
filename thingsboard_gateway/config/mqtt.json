@@ -120,7 +120,8 @@
       "requestTopicExpression": "sensor/${deviceName}/request/${methodName}/${requestId}",
       "responseTopicExpression": "sensor/${deviceName}/response/${methodName}/${requestId}",
       "responseTimeout": 10000,
-      "valueExpression": "${params}"
+      "valueExpression": "${params}",
+      "responseTopicQoS": 1
     },
     {
       "deviceNameFilter": ".*",
