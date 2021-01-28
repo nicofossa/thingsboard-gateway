@@ -81,8 +81,10 @@ class TBGatewayService:
         self.__saved_devices = {}
         self.__events = []
         self.name = ''.join(choice(ascii_lowercase) for _ in range(64))
-        self.__rpc_register_queue = Queue(-1)
-        self.__rpc_requests_in_progress = {}
+
+        self.__rpc_lock = RLock()
+        self.__rpc_pending_requests = {}
+
         self.__connected_devices_file = "connected_devices.json"
         self.tb_client = TBClient(self.__config["thingsboard"])
         self.tb_client.connect()
@@ -157,27 +159,24 @@ class TBGatewayService:
                                 log.exception(e)
                             if result == 256:
                                 log.warning("Error on RPC command: 256. Permission denied.")
-                if (self.__rpc_requests_in_progress or not self.__rpc_register_queue.empty()) and self.tb_client.is_connected():
-                    new_rpc_request_in_progress = {}
-                    if self.__rpc_requests_in_progress:
-                        for rpc_in_progress, data in self.__rpc_requests_in_progress.items():
-                            if cur_time >= data[1]:
-                                data[2](rpc_in_progress)
+
+                with self.__rpc_lock:
+                    if self.__rpc_pending_requests and self.tb_client.is_connected():
+                        for rpc_in_progress, data in self.__rpc_pending_requests.items():
+                            if cur_time >= data["timeout"] and not data["served"]:
+                                # Call user provided cancel method
+                                data["cancel_method"](rpc_in_progress)
+                                # Send failure response to the server
                                 self.cancel_rpc_request(rpc_in_progress)
-                                self.__rpc_requests_in_progress[rpc_in_progress] = "del"
-                        new_rpc_request_in_progress = {key: value for key, value in self.__rpc_requests_in_progress.items() if value != 'del'}
-                    if not self.__rpc_register_queue.empty():
-                        rpc_request_from_queue = self.__rpc_register_queue.get(False)
-                        topic = rpc_request_from_queue["topic"]
-                        data = rpc_request_from_queue["data"]
-                        new_rpc_request_in_progress[topic] = data
-                    self.__rpc_requests_in_progress = new_rpc_request_in_progress
-                else:
-                    try:
-                        sleep(.1)
-                    except Exception as e:
-                        log.exception(e)
-                        break
+                        __rpc_pending_requests = {key: value for key, value in self.__rpc_pending_requests.items() if not value["served"]}
+
+                # Why is it here? Can this be moved somewhere else or not?
+                try:
+                    sleep(.1)
+                except Exception as e:
+                    log.exception(e)
+                    break
+
                 if not self.__request_config_after_connect and self.tb_client.is_connected() and not self.tb_client.client.get_subscriptions_in_progress():
                     self.__request_config_after_connect = True
                     self.__check_shared_attributes()
@@ -560,13 +559,16 @@ class TBGatewayService:
         return result
 
     def is_rpc_in_progress(self, topic):
-        return topic in self.__rpc_requests_in_progress
+        with self.__rpc_lock:
+            return topic in self.__rpc_pending_requests and not self.__rpc_pending_requests[topic]["served"]
 
     def rpc_with_reply_processing(self, topic, content):
-        req_id = self.__rpc_requests_in_progress[topic][0]["data"]["id"]
-        device = self.__rpc_requests_in_progress[topic][0]["device"]
+        with self.__rpc_lock:
+            # Extracting RPC data and tagging it as served (under lock)
+            req_id = self.__rpc_pending_requests[topic]["content"]["data"]["id"]
+            device = self.__rpc_pending_requests[topic]["content"]["device"]
+            self.__rpc_pending_requests[topic]["served"] = True
         self.send_rpc_reply(device, req_id, content)
-        self.cancel_rpc_request(topic)
 
     def send_rpc_reply(self, device=None, req_id=None, content=None, success_sent=None, wait_for_publish=None, quality_of_service=0):
         try:
@@ -588,11 +590,13 @@ class TBGatewayService:
             log.exception(e)
 
     def register_rpc_request_timeout(self, content, timeout, topic, cancel_method):
-        self.__rpc_register_queue.put({"topic": topic, "data": (content, timeout, cancel_method)}, False)
-        # self.__rpc_requests_in_progress[topic] = (content, timeout, cancel_method)
+        with self.__rpc_lock:
+            self.__rpc_pending_requests[topic] = {"content": content, "timeout": timeout, "cancel_method": cancel_method, "served": False}
 
     def cancel_rpc_request(self, rpc_request):
-        content = self.__rpc_requests_in_progress[rpc_request][0]
+        with self.__rpc_lock:
+            content = self.__rpc_pending_requests[rpc_request]["content"]
+            self.__rpc_pending_requests[rpc_request]["served"] = True
         self.send_rpc_reply(device=content["device"], req_id=content["data"]["id"], success_sent=False)
 
     def _attribute_update_callback(self, content, *args):
