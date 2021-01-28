@@ -500,6 +500,7 @@ class MqttConnector(Connector, Thread):
 
         if self.__gateway.is_rpc_in_progress(message.topic):
             self.__gateway.rpc_with_reply_processing(message.topic, content)
+            self._client.unsubscribe(message.topic)
             return None
 
         self.__log.debug("Received message to topic \"%s\" with unknown interpreter data: \n\n\"%s\"",
